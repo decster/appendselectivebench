@@ -3,7 +3,7 @@
 #include <vector>
 #include <random>
 #include <memory>
-
+#include <string.h>
 #include <benchmark/benchmark.h>
 
 #define LIKELY(expr) __builtin_expect(!!(expr), 1)
@@ -123,21 +123,22 @@ vector<uint32_t> indexes;
 static void BM_AppendSelective(benchmark::State& state) {
     src_column.reset(new BinaryColumnBase());
     dest_column.reset(new BinaryColumnBase());
-    size_t bytes = 1024*1024*64;
-    size_t avglen = state.range(0);
+    size_t bytes = 1024*1024*256;
+    size_t type = state.range(0);
     size_t selectivity = state.range(1);
+    size_t avglen = state.range(2);
     size_t total_row = bytes/avglen;
     size_t select_row = total_row / selectivity;
+    string label = "row:" + to_string(total_row) + "_select:" + to_string(select_row) + "_keylen:" + to_string(avglen) + string(type == 0 ? " orig" : " prefetch");
     src_column->gen(avglen, total_row);
     indexes = src_column->gen_indexes(0, select_row);
-    if (state.range(2) == 0) {
-        state.SetLabel("orig");
+    state.SetLabel(label);
+    if (type == 0) {
         for (auto _ : state) {
             dest_column->append_selective(*src_column, indexes.data(), 0, indexes.size());
             dest_column->reset();
         }
     } else {
-        state.SetLabel("prefetch");
         for (auto _ : state) {
             dest_column->append_selective_prefetch(*src_column, indexes.data(), 0, indexes.size());
             dest_column->reset();
@@ -150,9 +151,9 @@ static void BM_AppendSelective(benchmark::State& state) {
 
 BENCHMARK(BM_AppendSelective)
     ->ArgsProduct({
-        {8, 16, 32, 64},
+        {1, 0},
         {10, 100, 1000},
-        {0, 1}
+        {8, 16, 32, 64},
     });
 
 BENCHMARK_MAIN();
