@@ -6,6 +6,9 @@
 
 #include <benchmark/benchmark.h>
 
+#define LIKELY(expr) __builtin_expect(!!(expr), 1)
+#define PREFETCH(addr) __builtin_prefetch(addr)
+
 using namespace std;
 
 class BinaryColumnBase {
@@ -51,6 +54,9 @@ public:
     }
 
     void append_selective(const BinaryColumnBase& src, const uint32_t* indexes, uint32_t from, uint32_t size);
+
+    void append_selective_prefetch(const BinaryColumnBase& src, const uint32_t* indexes, uint32_t from, uint32_t size);
+
 };
 
 void BinaryColumnBase::append_selective(const BinaryColumnBase& src, const uint32_t* indexes, uint32_t from, uint32_t size) {
@@ -79,33 +85,74 @@ void BinaryColumnBase::append_selective(const BinaryColumnBase& src, const uint3
     }
 }
 
+void BinaryColumnBase::append_selective_prefetch(const BinaryColumnBase& src, const uint32_t* indexes, uint32_t from, uint32_t size) {
+    const auto& src_column = src;
+    const auto& src_offsets = src_column._offsets;
+    const auto& src_bytes = src_column._bytes;
+
+    size_t cur_row_count = _offsets.size() - 1;
+    size_t cur_byte_size = _bytes.size();
+
+    _offsets.resize(cur_row_count + size + 1);
+    for (size_t i = 0; i < size; i++) {
+        uint32_t row_idx = indexes[from + i];
+        auto str_size = src_offsets[row_idx + 1] - src_offsets[row_idx];
+        _offsets[cur_row_count + i + 1] = _offsets[cur_row_count + i] + str_size;
+        cur_byte_size += str_size;
+    }
+    _bytes.resize(cur_byte_size);
+
+    auto* dest_bytes = _bytes.data();
+    for (size_t i = 0; i < size; i++) {
+        auto row_idx = indexes[from + i];
+        auto str_size = src_offsets[row_idx + 1] - src_offsets[row_idx];
+        uint32_t prefetch_i = i + 1;
+        if (LIKELY(prefetch_i < size)) {
+            auto prefetch_row_idx = indexes[from + prefetch_i];
+            PREFETCH(src_bytes.data() + src_offsets[prefetch_row_idx]);
+        }
+        memcpy(dest_bytes + _offsets[cur_row_count + i], src_bytes.data() + src_offsets[row_idx],
+               str_size);
+    }
+}
+
 unique_ptr<BinaryColumnBase> src_column;
 unique_ptr<BinaryColumnBase> dest_column;
 vector<uint32_t> indexes;
 
-static void DoSetup(const benchmark::State& state) {
+static void BM_AppendSelective(benchmark::State& state) {
     src_column.reset(new BinaryColumnBase());
     dest_column.reset(new BinaryColumnBase());
-    src_column->gen(10, 10000000);
-    indexes = src_column->gen_indexes(0, 1000);
-//    for (auto i : indexes) {
-//        cout << i << " ";
-//    }
-}
-
-static void DoTeardown(const benchmark::State& state) {
+    size_t bytes = 1024*1024*64;
+    size_t avglen = state.range(0);
+    size_t selectivity = state.range(1);
+    size_t total_row = bytes/avglen;
+    size_t select_row = total_row / selectivity;
+    src_column->gen(avglen, total_row);
+    indexes = src_column->gen_indexes(0, select_row);
+    if (state.range(2) == 0) {
+        state.SetLabel("orig");
+        for (auto _ : state) {
+            dest_column->append_selective(*src_column, indexes.data(), 0, indexes.size());
+            dest_column->reset();
+        }
+    } else {
+        state.SetLabel("prefetch");
+        for (auto _ : state) {
+            dest_column->append_selective_prefetch(*src_column, indexes.data(), 0, indexes.size());
+            dest_column->reset();
+        }
+    }
     src_column.reset();
     dest_column.reset();
     indexes.clear();
 }
 
-static void BM_AppendSelective(benchmark::State& state) {
-    for (auto _ : state) {
-        dest_column->append_selective(*src_column, indexes.data(), 0, indexes.size());
-        dest_column->reset();
-    }
-}
-
-BENCHMARK(BM_AppendSelective)->Setup(DoSetup)->Teardown(DoTeardown);;
+BENCHMARK(BM_AppendSelective)
+    ->ArgsProduct({
+        {8, 16, 32, 64},
+        {10, 100, 1000},
+        {0, 1}
+    });
 
 BENCHMARK_MAIN();
